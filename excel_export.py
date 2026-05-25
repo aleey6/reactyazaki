@@ -8,7 +8,8 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from config import COLORS, fmt_money
-from invoice_parser import InvoiceData
+from models import InvoiceData
+
 
 def contracts_to_excel(invoice: InvoiceData, plant: str = "", dept: str = "", project: str = "") -> bytes:
     """Génère un fichier Excel avec le détail des contrats."""
@@ -65,8 +66,8 @@ def contracts_to_excel(invoice: InvoiceData, plant: str = "", dept: str = "", pr
             c_obj.document_page or "—",
             c_obj.contract_type,
             c_obj.phone_number or "—",
-            len(c_obj.frais_mensuels),
-            len(c_obj.frais_ponctuels),
+            getattr(c_obj, 'articles_mensuels', len(getattr(c_obj, 'frais_mensuels', []))),
+            getattr(c_obj, 'articles_ponctuels', len(getattr(c_obj, 'frais_ponctuels', []))),
             c_obj.total_contrat,
         ]
         fill_color = COLORS['gris'] if i % 2 == 0 else COLORS['blanc']

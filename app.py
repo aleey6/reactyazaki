@@ -29,29 +29,16 @@ from invoice_parser import parse_invoice
 from budget_tracker import BudgetTracker
 from budget_models import DuplicateInvoiceError, ValidationError, BudgetProcessingError
 import database as db
+from excel_export import contracts_to_excel  
+from models import ContractInfo, InvoiceData
+
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 CONFIG_PATH = ROOT_DIR / "config.json"
 
 # ─── Models Pydantic ─────────────────────────────────────────────────────────
 
-class ContractInfo(BaseModel):
-    phone_number: Optional[str] = None
-    contract_type: Optional[str] = None
-    period_start: Optional[str] = None
-    period_end: Optional[str] = None
-    total_contrat: float = 0.0
 
-class InvoiceData(BaseModel):
-    invoice_number: str
-    invoice_date: Optional[str] = None
-    client_number: Optional[str] = None
-    client_name: Optional[str] = None
-    total: float = 0.0
-    total_ht: Optional[float] = None
-    total_ttc: Optional[float] = None
-    contracts: List[ContractInfo] = []
-    source_file: Optional[str] = None
 
 class ProcessInvoiceResponse(BaseModel):
     success: bool
@@ -295,13 +282,18 @@ async def process_invoice(
         buf = io.BytesIO(contents)
         
         # Parser la facture
+        # Parser la facture
         inv = parse_invoice(buf, ocr_engine=ocr_engine, progress_callback=None)
+
+        print("INVOICE =", type(inv))
+        print("NB CONTRACTS PARSED =", len(getattr(inv, "contracts", [])))
+
         inv.source_file = file.filename
-        
-        # Générer un numéro de facture unique si nécessaire
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        clean = re.sub(r"[^A-Za-z0-9_-]", "_", file.filename.rsplit(".", 1)[0])
-        inv.invoice_number = f"{clean}_{ts}"
+        # Générer un numéro de facture de secours uniquement si le parser n'en a pas trouvé
+        if not inv.invoice_number:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            clean = re.sub(r"[^A-Za-z0-9_-]", "_", file.filename.rsplit(".", 1)[0])
+            inv.invoice_number = f"{clean}_{ts}"
         
         # Trouver l'usine
         cfg = state.config
@@ -327,6 +319,7 @@ async def process_invoice(
             record = save_invoice_record(inv, plant, dept_label or "Multi-depts", "IAM")
             
             try:
+                print("DEBUG contracts =", len(record["contracts"]))
                 invoice_id = db.save_invoice(record)
             except Exception as exc:
                 print(f"⚠️ SQLite : {exc}")
@@ -338,8 +331,7 @@ async def process_invoice(
                 contracts_processed=result.contracts_processed,
                 total_deducted=result.total_deducted,
                 departments_affected=list(result.departments_affected),
-                unassigned_contracts=[{"phone_number": c.phone_number, "total": c.total_contrat} for c in result.unassigned_contracts],
-                duplicate=False
+                unassigned_contracts=[],
             )
             
         except DuplicateInvoiceError as e:
@@ -370,6 +362,104 @@ async def process_invoice(
         print(f"ERROR processing invoice: {str(e)}")
         print(f"Full traceback:\n{error_details}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    
+@app.post("/api/invoices/debug")
+async def debug_invoice(file: UploadFile = File(...)):
+    """Endpoint de debug pour voir ce que le parser extrait."""
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Seuls les fichiers PDF sont acceptés")
+    
+    try:
+        contents = await file.read()
+        buf = io.BytesIO(contents)
+        
+        inv = parse_invoice(buf, ocr_engine=None, progress_callback=None)
+        
+        return {
+            "success": True,
+            "invoice_number": inv.invoice_number,
+            "client_number": inv.client_number,
+            "invoice_date": inv.invoice_date,
+            "period_start": inv.period_start,
+            "period_end": inv.period_end,
+            "total": inv.total,
+            "contracts_count": len(inv.contracts),
+            "global_summary": {
+                "montant_ht": inv.global_summary.montant_ht,
+                "montant_ttc": inv.global_summary.montant_ttc,
+                "montant_tva": inv.global_summary.montant_tva,
+            },
+            "contracts": [
+                {
+                    "phone_number": c.phone_number,
+                    "contract_type": c.contract_type,
+                    "total_contrat": c.total_contrat,
+                    "period_start": c.period_start,
+                    "period_end": c.period_end,
+                    "articles_mensuels": c.articles_mensuels,
+                    "articles_ponctuels": c.articles_ponctuels,
+                }
+                for c in inv.contracts
+            ]
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+
+@app.post("/api/invoices/debug-full")
+async def debug_full_invoice(file: UploadFile = File(...)):
+    """Debug complet - montre tout ce que le parser extrait."""
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Seuls les fichiers PDF sont acceptés")
+    
+    try:
+        contents = await file.read()
+        buf = io.BytesIO(contents)
+        
+        inv = parse_invoice(buf, ocr_engine=None, progress_callback=None)
+        
+        # Extraire les premières lignes du PDF pour voir le texte brut
+        from pdfplumber import open as pdf_open
+        buf.seek(0)
+        first_page_text = ""
+        with pdf_open(buf) as pdf:
+            if len(pdf.pages) > 0:
+                first_page_text = pdf.pages[0].extract_text()[:2000]
+        
+        return {
+            "success": True,
+            "extracted_data": {
+                "invoice_number": inv.invoice_number,
+                "client_number": inv.client_number,
+                "invoice_date": inv.invoice_date,
+                "period_start": inv.period_start,
+                "period_end": inv.period_end,
+                "total": inv.total,
+                "contracts_count": len(inv.contracts),
+            },
+            "first_page_text": first_page_text,
+            "all_phone_numbers": list(set([c.phone_number for c in inv.contracts if c.phone_number]))[:10]
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+
+@app.delete("/api/invoices/clear-all")
+async def clear_all_invoices_data():
+    """Supprime TOUTES les factures et transactions."""
+    try:
+        # Vider la table des factures
+        db.clear_all_invoices()
+        
+        # Vider les transactions budgétaires
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM budget_transactions")
+            conn.execute("DELETE FROM departments")
+        
+        # Réinitialiser la configuration
+        state.budget_tracker.init_departments(state.config)
+        
+        return {"success": True, "message": "Toutes les données ont été effacées"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/invoices/export/{invoice_id}")
 async def export_invoice_excel(invoice_id: int):
@@ -384,16 +474,63 @@ async def export_invoice_excel(invoice_id: int):
         if not invoice_data:
             raise HTTPException(status_code=404, detail="Facture non trouvée")
         
-        # Recréer l'objet invoice à partir des données
-        # Note: Cette partie nécessite une implémentation plus complète
-        # Pour l'instant, retournons une erreur
-        raise HTTPException(status_code=501, detail="Export Excel à implémenter")
+        # Recréer les contrats
+        contracts = []
+        for c in invoice_data.get('contracts', []):
+            contract = ContractInfo(
+                phone_number=c.get('phone_number'),
+                contract_type=c.get('contract_type'),
+                period_start=c.get('period_start'),
+                period_end=c.get('period_end'),
+                total_contrat=c.get('total_contrat', 0),
+                page_number=c.get('page_number'),
+                document_page=c.get('document_page'),
+                articles_mensuels=c.get('articles_mensuels', len(c.get('frais_mensuels', []))),
+                articles_ponctuels=c.get('articles_ponctuels', len(c.get('frais_ponctuels', []))),
+            )
+            contracts.append(contract)
+        
+        # Recréer l'objet InvoiceData AVEC period_start et period_end
+        invoice_obj = InvoiceData(
+            invoice_number=invoice_data.get('invoice_number', ''),
+            invoice_date=invoice_data.get('invoice_date'),
+            client_number=invoice_data.get('client_number'),
+            client_name=invoice_data.get('client_name'),
+            total=invoice_data.get('total', 0),
+            total_ht=invoice_data.get('total_ht'),
+            total_ttc=invoice_data.get('total_ttc'),
+            contracts=contracts,
+            source_file=invoice_data.get('source_file'),
+            period_start=invoice_data.get('period_start'),  # AJOUTÉ
+            period_end=invoice_data.get('period_end')      # AJOUTÉ
+        )
+        
+        # Générer l'Excel
+        plant = invoice_data.get('plant', '')
+        departments = invoice_data.get('departments', '')
+        
+        excel_bytes = contracts_to_excel(
+            invoice=invoice_obj,
+            plant=plant,
+            dept=departments,
+            project=""
+        )
+        
+        # Retourner le fichier
+        filename = f"facture_{invoice_obj.invoice_number}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        return StreamingResponse(
+            io.BytesIO(excel_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
         
     except HTTPException:
         raise
     except Exception as e:
+        print(f"ERROR in export: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 @app.get("/api/plants", response_model=List[str])
 async def get_plants():
     """Retourne la liste de toutes les usines configurées."""
@@ -686,6 +823,8 @@ async def get_transactions(
         print(f"ERROR in /api/transactions: {str(e)}")
         print(f"Full traceback:\n{error_details}")
         raise HTTPException(status_code=500, detail=f"{str(e)} - Check server logs for details")
+
+
 
 @app.get("/api/reports/plant-summary")
 async def get_plant_summary():

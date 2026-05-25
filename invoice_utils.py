@@ -7,7 +7,7 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from config import DATA_DIR, MASTER_FILE, safe_filename
-from invoice_parser import InvoiceData
+from models import InvoiceData
 
 def contracts_dataframe(invoice: InvoiceData) -> pd.DataFrame:
     """Convertit les contrats en DataFrame pandas."""
